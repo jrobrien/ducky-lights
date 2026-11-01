@@ -28,8 +28,7 @@ keyboard as you paint.
 
 Then click **Set as startup** in the panel. A systemd user service
 (`ducky_lights.py --daemon`) applies that pattern, re-applies it every 15 s
-and after the keyboard is replugged. Edit the path in
-`ducky-lights.service` if you don't keep the repo at `~/Projects/ducky-lights`.
+and after the keyboard is replugged. The installer fills in the repo path, so it can live anywhere. Re-run it if you move the repo.
 Stop it with `systemctl --user disable --now ducky-lights`.
 
 ## Limits
