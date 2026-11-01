@@ -7,6 +7,8 @@ dependencies.
 
 ![ducky-lights](docs/screenshot.png)
 
+*The panel with the Arc Blueberry theme active. Following the theme is the default, so nothing needs to be painted or saved first.*
+
 ## Use
 
 ```sh
@@ -25,9 +27,13 @@ keyboard as you paint.
 **Match Omarchy theme** paints the keyboard from the active theme's
 `colors.toml`: letters take the accent colour, function keys blue, the
 navigation cluster and arrows cyan, numpad green, media keys yellow,
-modifiers magenta, Esc red. Tick **Follow theme** to make that the startup
-pattern: the service then re-colours the keyboard whenever you change theme.
-**Set as startup** switches back to a fixed pattern.
+modifiers magenta, Esc red.
+
+**Following the theme is the default.** With no saved pattern, the service
+(and the panel's "Follow theme" box, ticked and marked "default at startup") shows the theme on the
+keyboard and re-colours it whenever you change theme. **Set as startup**, or
+unticking **Follow theme**, saves the current pattern instead; ticking the box
+again goes back to following.
 
 Theme following is specific to [Omarchy](https://omarchy.org/). It reads
 `~/.local/state/omarchy/current/theme/colors.toml`, which Omarchy rewrites on
@@ -42,10 +48,18 @@ Python 3.11+ is needed for the TOML parser.
 ./install-service.sh
 ```
 
-Then click **Set as startup** in the panel. A systemd user service
+That's all that's needed on Omarchy: with no saved pattern the keyboard follows
+the current theme. To use a fixed pattern instead, paint it in the panel and
+click **Set as startup**. A systemd user service
 (`ducky_lights.py --daemon`) applies that pattern, re-applies it every 15 s
 and after the keyboard is replugged. The installer fills in the repo path, so it can live anywhere. Re-run it if you move the repo.
 Stop it with `systemctl --user disable --now ducky-lights`.
+
+While the panel is open the service steps aside so only one program talks to
+the keyboard: the panel holds a lock on `~/.cache/ducky-lights/panel.lock`,
+the service sees it and lets go of the keyboard (the lights stay as they are),
+and takes over again with your startup pattern when the panel closes. The lock
+is released by the OS if the panel crashes, so the service always recovers.
 
 ## Limits
 

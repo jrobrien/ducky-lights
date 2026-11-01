@@ -4,11 +4,13 @@
 Protocol from javitonino/duckylights (GPL-2.0). No dependencies beyond Tk.
 """
 import colorsys
+import fcntl
 import glob
 import json
 import os
 import select
 import sys
+import threading
 import tomllib
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox
@@ -18,6 +20,7 @@ ROWS, COLS = 6, 22
 PAL_W, PAL_H = 480, 48
 PROFILE_DIR = os.path.expanduser('~/.config/ducky-lights')
 THEME = os.path.expanduser('~/.local/state/omarchy/current/theme/colors.toml')
+LOCK = os.path.expanduser('~/.cache/ducky-lights/panel.lock')  # held by the panel while open
 ACTIVE = os.path.join(PROFILE_DIR, 'active.json')  # applied at login by the service
 
 # Inferred from the duckylights ES layout; colour index is col * ROWS + row.
@@ -66,8 +69,9 @@ class Keyboard:
     def _write(self, hexmsg):
         data = bytes.fromhex(hexmsg).ljust(64, b'\0')
         os.write(self.fd, data)
-        if select.select([self.fd], [], [], 0.5)[0]:
-            os.read(self.fd, 256)
+        if not select.select([self.fd], [], [], 0.3)[0]:
+            raise OSError('keyboard did not answer')
+        os.read(self.fd, 256)
 
     def apply(self, colors):
         """colors: list of ROWS*COLS 'rrggbb' strings, index = col*ROWS+row."""
@@ -110,6 +114,24 @@ def load_colors(path):
     return cols
 
 
+def startup_colors():
+    """The pattern to show at login: the saved one, else the Omarchy theme (the default)."""
+    if os.path.exists(ACTIVE):
+        return load_colors(ACTIVE)
+    return theme_colors()
+
+
+def following_theme():
+    """True when the startup pattern follows the theme, explicitly or by default."""
+    try:
+        d = json.load(open(ACTIVE))
+        return isinstance(d, dict) and bool(d.get('theme'))
+    except FileNotFoundError:
+        return os.path.exists(THEME)
+    except ValueError:
+        return False
+
+
 def theme_palette():
     with open(THEME, 'rb') as f:
         return tomllib.load(f)
@@ -122,7 +144,7 @@ GROUPS = [
     ('cyan', {'PRTSC', 'SCRLK', 'PAUSE', 'INS', 'HOME', 'PAGUP', 'DEL', 'END',
               'PAGDN', 'UP', 'DOWN', 'LEFT', 'RIGHT'}),
     ('yellow', {'CALC', 'MUTE', 'VOL-', 'VOL+'}),
-    ('magenta', {'LSH', 'RSH', 'LCTRL', 'RCTRL', 'LALT', 'RALT', 'LMETA', 'RMETA',
+    ('magenta', {'LSH', 'RTSH', 'LCTRL', 'RCTRL', 'LALT', 'RALT', 'LMETA', 'RMETA',
                  'FN', 'CAPS', 'TAB', 'BACK', 'ENTER'}),
 ]
 
@@ -145,20 +167,49 @@ def theme_colors():
     return out
 
 
+def lock_fd():
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    return os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+
+
+def panel_open():
+    """True while a panel holds the lock. The OS drops the lock if the panel dies."""
+    fd = lock_fd()
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+
+
 def daemon():
     """Hold the saved startup pattern on the keyboard; follow edits and replugs."""
     import time
     kb, mtime, last = None, None, 0
     while True:
         try:
-            m = os.path.getmtime(ACTIVE) if os.path.exists(ACTIVE) else None
-            if m and os.path.exists(THEME):
-                m = (m, os.path.getmtime(THEME), os.path.realpath(THEME))
+            mt = lambda p: os.path.getmtime(p) if os.path.exists(p) else None
+            # Re-apply when the saved pattern or the theme changes. With no saved
+            # pattern the default is to follow the theme, so only the theme counts.
+            m = (mt(ACTIVE), mt(THEME), os.path.realpath(THEME))
+            if m[0] is None and m[1] is None:
+                time.sleep(0.5)  # nothing to show: no saved pattern and no Omarchy theme
+                continue
+            if panel_open():
+                # Let the panel have the keyboard alone. Closing the handle
+                # without leaving programming mode keeps the lights as they are.
+                if kb:
+                    os.close(kb.fd)
+                    kb = None
+                time.sleep(0.5)
+                continue
             if kb is None:
                 kb = Keyboard()
                 mtime = None
             if m and (m != mtime or time.time() - last > 15):
-                kb.apply(frame(load_colors(ACTIVE)))
+                kb.apply(frame(startup_colors()))
                 mtime, last = m, time.time()
         except (OSError, ValueError, AssertionError) as e:
             print('ducky-lights:', e, file=sys.stderr, flush=True)
@@ -168,7 +219,7 @@ def daemon():
                 except OSError:
                     pass
             kb = None
-        time.sleep(2)
+        time.sleep(0.5)
 
 
 def hexcol(rgb):
@@ -182,19 +233,30 @@ class App(tk.Tk):
         self.configure(bg='#1e1e2e')
         self.keys = parse_layout()
         self.colors = ['ffffff'] * (ROWS * COLS)
+        try:
+            self.colors = startup_colors()  # show what the keyboard shows at login
+        except (OSError, ValueError, AssertionError):
+            pass
         self.brush = tk.StringVar(value='ff0000')
         self.live = tk.BooleanVar(value=True)
         self.status = tk.StringVar()
         self.kb = None
+        self._cv = threading.Condition()
+        self._pending, self._stop, self._msg = None, False, None
         self.rects = {}
         self.connect()
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+        self.after(200, self._poll_msg)
         self.build()
         os.makedirs(PROFILE_DIR, exist_ok=True)
 
     def connect(self):
         try:
             self.kb = Keyboard()
-            self.status.set(f'Connected: {self.kb.path}')
+            self.status.set(f'Connected: {self.kb.path}. Startup pattern: ' + (
+                'follows the Omarchy theme (default)' if following_theme()
+                else 'your saved pattern'))
         except (FileNotFoundError, PermissionError) as e:
             self.kb = None
             hint = ' - run ./install.sh once' if isinstance(e, PermissionError) else ''
@@ -223,12 +285,14 @@ class App(tk.Tk):
                  'then paint keys with it', bg='#1e1e2e', fg='#aaa',
                  justify='left').pack(side='left', padx=12)
 
-        self.follow = tk.BooleanVar(value=self.following())
-        tk.Button(pal, text='Match Omarchy theme', command=self.match_theme).pack(
-            side='right', padx=2)
-        tk.Checkbutton(pal, text='Follow theme', variable=self.follow, bg='#1e1e2e',
-                       fg='#ccc', selectcolor='#333', command=self.toggle_follow).pack(
-            side='right', padx=8)
+        self.follow = tk.BooleanVar(value=following_theme())
+        theme = tk.Frame(pal, bg='#1e1e2e')
+        theme.pack(side='right', padx=2)
+        tk.Button(theme, text='Match Omarchy theme', command=self.match_theme).pack(fill='x')
+        tk.Checkbutton(theme, text='Follow theme', variable=self.follow, bg='#1e1e2e',
+                       fg='#ccc', selectcolor='#333', activebackground='#1e1e2e',
+                       command=self.toggle_follow).pack(anchor='w', pady=(4, 0))
+        tk.Label(theme, text='default at startup', bg='#1e1e2e', fg='#777').pack(anchor='w')
 
         bar = tk.Frame(self, bg='#1e1e2e')
         bar.pack(fill='x', padx=10)
@@ -341,22 +405,48 @@ class App(tk.Tk):
             self.apply()
 
     def apply(self):
+        """Queue the current pattern for the worker; never blocks the UI."""
         self._after = None
         if not self.kb:
             return
-        try:
-            self.kb.apply(frame(self.colors))
-            self.status.set(f'Applied to {self.kb.path}')
-        except OSError as e:
-            self.status.set(f'Write failed: {e} (try Reconnect)')
+        with self._cv:
+            self._pending = frame(self.colors)
+            self._cv.notify()
 
-    @staticmethod
-    def following():
-        try:
-            d = json.load(open(ACTIVE))
-            return isinstance(d, dict) and bool(d.get('theme'))
-        except (OSError, ValueError):
-            return False
+    def _worker(self):
+        """Sends only the newest queued frame, so a slow keyboard can't pile up writes."""
+        while True:
+            with self._cv:
+                while self._pending is None and not self._stop:
+                    self._cv.wait()
+                if self._pending is None:
+                    return
+                out, self._pending = self._pending, None
+            kb = self.kb
+            if not kb:
+                continue
+            try:
+                kb.apply(out)
+                self._msg = f'Applied to {kb.path}'
+            except OSError as e:
+                self._msg = f'Write failed: {e} (try Reconnect)'
+
+    def _poll_msg(self):
+        if self._msg:
+            self.status.set(self._msg)
+            self._msg = None
+        self.after(200, self._poll_msg)
+
+    def shutdown(self, final=None):
+        """Stop the worker (after it sends `final`, if any) and release the keyboard."""
+        with self._cv:
+            if final is not None:
+                self._pending = final
+            self._stop = True
+            self._cv.notify()
+        self._thread.join(5)
+        if self.kb:
+            self.kb.close(leave_lights=final is not None)
 
     def set_startup(self):
         json.dump(self.colors, open(ACTIVE, 'w'))
@@ -378,7 +468,7 @@ class App(tk.Tk):
 
     def toggle_follow(self):
         if not self.follow.get():
-            self.status.set('No longer following the theme (startup pattern unchanged)')
+            self.set_startup()  # keep the current pattern instead of the theme
             return
         if self.match_theme():
             json.dump({'theme': True}, open(ACTIVE, 'w'))
@@ -388,7 +478,8 @@ class App(tk.Tk):
 
     def reconnect(self):
         if self.kb:
-            self.kb.close()
+            kb, self.kb = self.kb, None
+            kb.close()
         self.connect()
         self.apply()
 
@@ -413,22 +504,31 @@ class App(tk.Tk):
 
 
 def main():
+    import time
+    fd = lock_fd()
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit('ducky-lights: the panel is already open')
+    time.sleep(1)  # give the background service time to let go of the keyboard
     app = App()
     app.apply()
 
     def quit_():
-        if app.kb:
-            # If a startup pattern exists the service keeps the lights; don't
-            # leave programming mode, which would revert them.
-            if os.path.exists(ACTIVE):
-                try:
-                    app.kb.apply(frame(load_colors(ACTIVE)))
-                except (OSError, ValueError, AssertionError):
-                    pass
-            app.kb.close(leave_lights=os.path.exists(ACTIVE))
+        # If a startup pattern exists the service keeps the lights; send it
+        # and don't leave programming mode, which would revert them.
+        final = None
+        try:
+            final = frame(startup_colors())
+        except (OSError, ValueError, AssertionError):
+            pass
+        app.shutdown(final)
         app.destroy()
     app.protocol('WM_DELETE_WINDOW', quit_)
     app.mainloop()
+    # Everything is released; skip Tcl/Tk interpreter teardown, which can hang.
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == '__main__':
