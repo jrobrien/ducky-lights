@@ -9,6 +9,7 @@ import json
 import os
 import select
 import sys
+import tomllib
 import tkinter as tk
 from tkinter import colorchooser, filedialog, messagebox
 
@@ -16,6 +17,7 @@ VID, PID, IFACE = '04d9', '0348', 'input1'
 ROWS, COLS = 6, 22
 PAL_W, PAL_H = 480, 48
 PROFILE_DIR = os.path.expanduser('~/.config/ducky-lights')
+THEME = os.path.expanduser('~/.local/state/omarchy/current/theme/colors.toml')
 ACTIVE = os.path.join(PROFILE_DIR, 'active.json')  # applied at login by the service
 
 # Inferred from the duckylights ES layout; colour index is col * ROWS + row.
@@ -100,9 +102,47 @@ def frame(colors):
 
 
 def load_colors(path):
+    """A saved pattern, or {"theme": true} meaning follow the Omarchy theme."""
     cols = json.load(open(path))
+    if isinstance(cols, dict) and cols.get('theme'):
+        return theme_colors()
     assert len(cols) == ROWS * COLS
     return cols
+
+
+def theme_palette():
+    with open(THEME, 'rb') as f:
+        return tomllib.load(f)
+
+
+# Which theme colour each group of keys takes.
+GROUPS = [
+    ('red', {'ESC'}),
+    ('blue', {f'F{i}' for i in range(1, 13)}),
+    ('cyan', {'PRTSC', 'SCRLK', 'PAUSE', 'INS', 'HOME', 'PAGUP', 'DEL', 'END',
+              'PAGDN', 'UP', 'DOWN', 'LEFT', 'RIGHT'}),
+    ('yellow', {'CALC', 'MUTE', 'VOL-', 'VOL+'}),
+    ('magenta', {'LSH', 'RSH', 'LCTRL', 'RCTRL', 'LALT', 'RALT', 'LMETA', 'RMETA',
+                 'FN', 'CAPS', 'TAB', 'BACK', 'ENTER'}),
+]
+
+
+def theme_colors():
+    """Per-key pattern from the active Omarchy theme: letters take the accent
+    colour, other key groups take the theme's red/blue/cyan/yellow/magenta/green."""
+    p = theme_palette()
+    col = lambda name: p.get(name, p.get('accent', '#ffffff')).lstrip('#').lower()
+    out = ['000000'] * (ROWS * COLS)
+    for (r, c), label in parse_layout().items():
+        name = 'accent'
+        if label.startswith('NUM') or label == 'NENTR':
+            name = 'green'
+        else:
+            for n, labels in GROUPS:
+                if label in labels:
+                    name = n
+        out[c * ROWS + r] = col(name)
+    return out
 
 
 def daemon():
@@ -112,6 +152,8 @@ def daemon():
     while True:
         try:
             m = os.path.getmtime(ACTIVE) if os.path.exists(ACTIVE) else None
+            if m and os.path.exists(THEME):
+                m = (m, os.path.getmtime(THEME), os.path.realpath(THEME))
             if kb is None:
                 kb = Keyboard()
                 mtime = None
@@ -180,6 +222,13 @@ class App(tk.Tk):
         tk.Label(pal, text='Click or right-click the rainbow to select a colour,\n'
                  'then paint keys with it', bg='#1e1e2e', fg='#aaa',
                  justify='left').pack(side='left', padx=12)
+
+        self.follow = tk.BooleanVar(value=self.following())
+        tk.Button(pal, text='Match Omarchy theme', command=self.match_theme).pack(
+            side='right', padx=2)
+        tk.Checkbutton(pal, text='Follow theme', variable=self.follow, bg='#1e1e2e',
+                       fg='#ccc', selectcolor='#333', command=self.toggle_follow).pack(
+            side='right', padx=8)
 
         bar = tk.Frame(self, bg='#1e1e2e')
         bar.pack(fill='x', padx=10)
@@ -301,9 +350,41 @@ class App(tk.Tk):
         except OSError as e:
             self.status.set(f'Write failed: {e} (try Reconnect)')
 
+    @staticmethod
+    def following():
+        try:
+            d = json.load(open(ACTIVE))
+            return isinstance(d, dict) and bool(d.get('theme'))
+        except (OSError, ValueError):
+            return False
+
     def set_startup(self):
         json.dump(self.colors, open(ACTIVE, 'w'))
+        self.follow.set(False)
         self.status.set('Saved as startup pattern (applied at login by the service)')
+
+    def match_theme(self):
+        try:
+            cols = theme_colors()
+        except (OSError, tomllib.TOMLDecodeError) as e:
+            self.status.set(f'Theme not available: {e}')
+            return False
+        self.colors = cols
+        for (r, c) in self.keys:
+            self.set_key(r, c, cols[c * ROWS + r])
+        self.maybe_apply()
+        self.status.set('Matched the current Omarchy theme')
+        return True
+
+    def toggle_follow(self):
+        if not self.follow.get():
+            self.status.set('No longer following the theme (startup pattern unchanged)')
+            return
+        if self.match_theme():
+            json.dump({'theme': True}, open(ACTIVE, 'w'))
+            self.status.set('Following the Omarchy theme: keyboard updates when you change theme')
+        else:
+            self.follow.set(False)
 
     def reconnect(self):
         if self.kb:

@@ -20,6 +20,22 @@ Rainbow, Gradient and Off are one click each; Save/Load keep patterns as
 JSON in `~/.config/ducky-lights`. With **Live** ticked, changes go to the
 keyboard as you paint.
 
+## Follow the Omarchy theme
+
+**Match Omarchy theme** paints the keyboard from the active theme's
+`colors.toml`: letters take the accent colour, function keys blue, the
+navigation cluster and arrows cyan, numpad green, media keys yellow,
+modifiers magenta, Esc red. Tick **Follow theme** to make that the startup
+pattern: the service then re-colours the keyboard whenever you change theme.
+**Set as startup** switches back to a fixed pattern.
+
+Theme following is specific to [Omarchy](https://omarchy.org/). It reads
+`~/.local/state/omarchy/current/theme/colors.toml`, which Omarchy rewrites on
+every `omarchy theme set`, and the service polls that file's modification time
+every couple of seconds. On any other system that file doesn't exist, so the
+button reports "Theme not available" and everything else works as before.
+Python 3.11+ is needed for the TOML parser.
+
 ## Keep the pattern at login
 
 ```sh
